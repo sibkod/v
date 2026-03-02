@@ -212,6 +212,29 @@ fn map_eq_int_8(a voidptr, b voidptr) bool {
 	return unsafe { *&u64(a) == *&u64(b) }
 }
 
+// map_map_eq compares two maps for equality.
+// Returns true if both maps have the same keys and associated values.
+fn map_map_eq(a map, b map) bool {
+	if a.len != b.len {
+		return false
+	}
+	for i := 0; i < a.key_values.len; i++ {
+		if !a.key_values.has_index(i) {
+			continue
+		}
+		k := a.key_values.key(i)
+		if !b.exists(k) {
+			return false
+		}
+		va := a.key_values.value(i)
+		vb := b.get(k, va)
+		if unsafe { C.memcmp(va, vb, a.value_bytes) } != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 @[inline]
 fn map_clone_string(dest voidptr, pkey voidptr) {
 	unsafe {
@@ -382,6 +405,10 @@ fn (mut m map) meta_greater(_index u32, _metas u32, kvi u32) {
 		}
 		index += 2
 		meta += probe_inc
+		// Grow metas if probing is approaching the buffer boundary
+		if index + 2 >= m.even_index + 2 + m.extra_metas {
+			m.ensure_extra_metas_grow()
+		}
 	}
 	unsafe {
 		m.metas[index] = meta
@@ -389,6 +416,19 @@ fn (mut m map) meta_greater(_index u32, _metas u32, kvi u32) {
 	}
 	probe_count := (meta >> hashbits) - 1
 	m.ensure_extra_metas(probe_count)
+}
+
+fn (mut m map) ensure_extra_metas_grow() {
+	size_of_u32 := sizeof(u32)
+	old_mem_size := (m.even_index + 2 + m.extra_metas)
+	m.extra_metas += extra_metas_inc
+	mem_size := (m.even_index + 2 + m.extra_metas)
+	unsafe {
+		x := realloc_data(&u8(m.metas), int(size_of_u32 * old_mem_size), int(size_of_u32 * mem_size))
+		m.metas = &u32(x)
+		// Use explicit byte arithmetic: cast to &u8 to avoid pointer scaling issues
+		vmemset(&u8(m.metas) + (mem_size - extra_metas_inc) * size_of_u32, 0, int(sizeof(u32) * extra_metas_inc))
+	}
 }
 
 @[inline]
@@ -401,7 +441,8 @@ fn (mut m map) ensure_extra_metas(probe_count u32) {
 		unsafe {
 			x := realloc_data(&u8(m.metas), int(size_of_u32 * old_mem_size), int(size_of_u32 * mem_size))
 			m.metas = &u32(x)
-			vmemset(m.metas + mem_size - extra_metas_inc, 0, int(sizeof(u32) * extra_metas_inc))
+			// Use explicit byte arithmetic: cast to &u8 to avoid pointer scaling issues
+			vmemset(&u8(m.metas) + (mem_size - extra_metas_inc) * size_of_u32, 0, int(sizeof(u32) * extra_metas_inc))
 		}
 		// Should almost never happen
 		if probe_count == 252 {
@@ -414,8 +455,9 @@ fn (mut m map) ensure_extra_metas(probe_count u32) {
 // not equivalent to the key of any other element already in the container.
 // If the key already exists, its value is changed to the value of the new element.
 fn (mut m map) set(key voidptr, value voidptr) {
-	load_factor := f32(u32(m.len) << 1) / f32(m.even_index)
-	if load_factor > max_load_factor {
+	// Integer-based load factor check: equivalent to (2*len)/even_index > 0.8
+	// which simplifies to 5*len > 2*even_index (avoids float ops broken in ARM64 backend)
+	if u32(5) * u32(m.len) > u32(2) * m.even_index {
 		m.expand()
 	}
 	mut index, mut meta := m.key_to_index(key)
@@ -505,8 +547,8 @@ fn (mut m map) cached_rehash(old_cap u32) {
 		old_index := (i - old_probe_count) & (m.even_index >> 1)
 		mut index := (old_index | (old_meta << m.shift)) & m.even_index
 		mut meta := (old_meta & hash_mask) | probe_inc
-		index, meta = m.meta_less(index, meta)
 		kv_index := unsafe { old_metas[i + 1] }
+		index, meta = m.meta_less(index, meta)
 		m.meta_greater(index, meta, kv_index)
 	}
 	unsafe { free(old_metas) }
@@ -543,6 +585,9 @@ fn (mut m map) get_and_set(key voidptr, zero voidptr) voidptr {
 // the method returns a reference to its mapped value.
 // If not, a zero/default value is returned.
 fn (m &map) get(key voidptr, zero voidptr) voidptr {
+	if m.len == 0 {
+		return zero
+	}
 	mut index, mut meta := m.key_to_index(key)
 	for {
 		if meta == unsafe { m.metas[index] } {
@@ -567,6 +612,9 @@ fn (m &map) get(key voidptr, zero voidptr) voidptr {
 // If not, a zero pointer is returned.
 // This is used in `x := m['key'] or { ... }`
 fn (m &map) get_check(key voidptr) voidptr {
+	if m.len == 0 {
+		return 0
+	}
 	mut index, mut meta := m.key_to_index(key)
 	for {
 		if meta == unsafe { m.metas[index] } {
@@ -588,6 +636,9 @@ fn (m &map) get_check(key voidptr) voidptr {
 
 // Checks whether a particular key exists in the map.
 fn (m &map) exists(key voidptr) bool {
+	if m.len == 0 {
+		return false
+	}
 	mut index, mut meta := m.key_to_index(key)
 	for {
 		if meta == unsafe { m.metas[index] } {

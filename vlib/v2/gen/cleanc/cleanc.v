@@ -102,6 +102,14 @@ fn is_empty_stmt(s ast.Stmt) bool {
 	return s is ast.EmptyStmt
 }
 
+fn stmt_has_valid_data(stmt ast.Stmt) bool {
+	return unsafe { (&u64(&stmt))[1] } != 0
+}
+
+fn expr_has_valid_data(expr ast.Expr) bool {
+	return unsafe { (&u64(&expr))[1] } != 0
+}
+
 pub fn Gen.new(files []ast.File) &Gen {
 	return Gen.new_with_env_and_pref(files, unsafe { nil }, unsafe { nil })
 }
@@ -150,6 +158,9 @@ pub fn Gen.new_with_env_and_pref(files []ast.File, env &types.Environment, p &pr
 fn (mut g Gen) gen_file(file ast.File) {
 	g.set_file_module(file)
 	for stmt in file.stmts {
+		if !stmt_has_valid_data(stmt) {
+			continue
+		}
 		// Skip struct/enum/type/interface/const decls - already emitted in earlier passes
 		if stmt is ast.StructDecl || stmt is ast.EnumDecl || stmt is ast.TypeDecl
 			|| stmt is ast.ConstDecl || stmt is ast.InterfaceDecl {
@@ -259,6 +270,9 @@ pub fn (mut g Gen) gen() string {
 	for file in g.files {
 		g.set_file_module(file)
 		for stmt in file.stmts {
+			if !stmt_has_valid_data(stmt) {
+				continue
+			}
 			if stmt is ast.GlobalDecl {
 				for field in stmt.fields {
 					if g.cur_module != '' && g.cur_module != 'main' && g.cur_module != 'builtin' {
@@ -275,6 +289,9 @@ pub fn (mut g Gen) gen() string {
 	for file in g.files {
 		g.set_file_module(file)
 		for stmt in file.stmts {
+			if !stmt_has_valid_data(stmt) {
+				continue
+			}
 			if stmt is ast.StructDecl {
 				if stmt.language == .c {
 					continue
@@ -315,6 +332,9 @@ pub fn (mut g Gen) gen() string {
 	for file in g.files {
 		g.set_file_module(file)
 		for stmt in file.stmts {
+			if !stmt_has_valid_data(stmt) {
+				continue
+			}
 			if stmt is ast.EnumDecl {
 				g.gen_enum_decl(stmt)
 			} else if stmt is ast.TypeDecl {
@@ -337,6 +357,9 @@ pub fn (mut g Gen) gen() string {
 	for file in g.files {
 		g.set_file_module(file)
 		for stmt in file.stmts {
+			if !stmt_has_valid_data(stmt) {
+				continue
+			}
 			if stmt is ast.StructDecl {
 				if stmt.language == .c {
 					continue
@@ -407,6 +430,9 @@ pub fn (mut g Gen) gen() string {
 			continue
 		}
 		for stmt in file.stmts {
+			if !stmt_has_valid_data(stmt) {
+				continue
+			}
 			if stmt is ast.ConstDecl {
 				g.gen_const_decl(stmt)
 			}
@@ -416,7 +442,9 @@ pub fn (mut g Gen) gen() string {
 	// Recursive array equality helper for nested arrays and string arrays
 	g.sb.writeln('bool string__eq(string a, string b);')
 	g.sb.writeln('static inline bool __v2_array_eq(array a, array b) {')
-	g.sb.writeln('	if (a.len != b.len || a.element_size != b.element_size) return false;')
+	g.sb.writeln('	if (a.len != b.len) return false;')
+	g.sb.writeln('	if (a.len == 0) return true;')
+	g.sb.writeln('	if (a.element_size != b.element_size) return false;')
 	g.sb.writeln('	if (a.element_size == sizeof(array)) {')
 	g.sb.writeln('		for (int i = 0; i < a.len; i++) {')
 	g.sb.writeln('			if (!__v2_array_eq(((array*)a.data)[i], ((array*)b.data)[i])) return false;')
@@ -441,6 +469,9 @@ pub fn (mut g Gen) gen() string {
 	for file in g.files {
 		g.set_file_module(file)
 		for stmt in file.stmts {
+			if !stmt_has_valid_data(stmt) {
+				continue
+			}
 			if stmt is ast.FnDecl {
 				if !g.should_emit_fn_decl(g.cur_module, stmt) {
 					continue
@@ -451,8 +482,12 @@ pub fn (mut g Gen) gen() string {
 				if stmt.language == .c && stmt.stmts.len == 0 {
 					continue
 				}
-				// Skip generic functions - they have unresolved type params
+				// Generic functions: emit as macros for known simple functions
 				if stmt.typ.generic_params.len > 0 {
+					gfn_name := g.get_fn_name(stmt)
+					if gfn_name != '' {
+						g.emit_generic_fn_macro(gfn_name, stmt)
+					}
 					continue
 				}
 				fn_name := g.get_fn_name(stmt)
@@ -488,10 +523,15 @@ pub fn (mut g Gen) gen() string {
 
 	// Pass 5: Everything else (function bodies, consts, globals, etc.)
 	g.pass5_start_pos = g.sb.len
+	// Pre-pass: emit extern forward declarations for all globals across all modules
+	// to avoid ordering issues (e.g. rand__default_rng used before its definition).
+	for file in g.files {
+		g.set_file_module(file)
+		g.gen_file_extern_globals(file)
+	}
 	for file in g.files {
 		g.set_file_module(file)
 		if !g.should_emit_module(g.cur_module) {
-			g.gen_file_extern_globals(file)
 			g.gen_file_extern_consts(file)
 			continue
 		}
@@ -499,6 +539,13 @@ pub fn (mut g Gen) gen() string {
 	}
 	g.emit_needed_ierror_wrappers()
 	g.emit_needed_interface_method_wrappers()
+	// Map str/eq functions are type-specific (Map_int_int_str, Map_string_int_map_eq, etc.)
+	// and depend on which concrete map types the user program uses. They must be emitted
+	// in the main compilation unit, NOT in the cache (which is shared across programs).
+	if g.cache_bundle_name.len == 0 {
+		g.emit_map_str_functions()
+		g.emit_map_eq_functions()
+	}
 	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
 		'pass 5 file bodies')
 
@@ -511,6 +558,30 @@ pub fn (mut g Gen) gen() string {
 		g.sb.writeln('\tg_main_argv = (void*)___argv;')
 		for init_call in g.cached_init_calls {
 			g.sb.writeln('\t${init_call}();')
+		}
+		// Call module init() functions and __v_init_consts_main — test files have
+		// no main() function, so the transformer's injected init calls are not present.
+		for fn_name, _ in g.fn_return_types {
+			// Module init functions: MODULE__init (e.g., rand__init)
+			// Skip methods (Type__method patterns where Type is capitalized)
+			if fn_name.ends_with('__init') && fn_name.count('__') == 1 {
+				first_char := fn_name[0]
+				if first_char >= `a` && first_char <= `z` {
+					if params := g.fn_param_is_ptr[fn_name] {
+						if params.len == 0 {
+							g.sb.writeln('\t${fn_name}();')
+						}
+					} else {
+						g.sb.writeln('\t${fn_name}();')
+					}
+				}
+			}
+		}
+		// Call all module const initialization functions
+		for fn_name, _ in g.fn_return_types {
+			if fn_name.contains('__v_init_consts_') {
+				g.sb.writeln('\t${fn_name}();')
+			}
 		}
 		for test_fn in test_fn_names {
 			msg_run := 'Running test: ${test_fn}...'
@@ -702,6 +773,34 @@ fn strip_literal_quotes(raw string) string {
 	return raw
 }
 
+// process_line_continuations strips V line continuation sequences from string content.
+// A `\` immediately before a newline (0x0a) in V source means line continuation:
+// the `\`, the newline, and any leading whitespace on the next line are removed.
+fn process_line_continuations(val string) string {
+	mut i := 0
+	for i < val.len {
+		if val[i] == `\\` && i + 1 < val.len && val[i + 1] == `\n` {
+			// Found `\` + newline: strip `\`, newline, and leading whitespace
+			mut sb := strings.new_builder(val.len)
+			sb.write_string(val[..i])
+			mut j := i + 2 // skip `\` and newline
+			for j < val.len && val[j] in [` `, `\t`] {
+				j++
+			}
+			sb.write_string(val[j..])
+			// Process recursively for multiple continuations
+			return process_line_continuations(sb.str())
+		}
+		// Skip past V escape sequences (e.g., `\n`, `\t`, `\\`)
+		if val[i] == `\\` && i + 1 < val.len {
+			i += 2
+			continue
+		}
+		i++
+	}
+	return val
+}
+
 fn escape_char_literal_content(raw string) string {
 	mut sb := strings.new_builder(raw.len + 4)
 	for ch in raw {
@@ -717,8 +816,28 @@ fn escape_char_literal_content(raw string) string {
 
 fn escape_c_string_literal_segment(raw string) string {
 	mut sb := strings.new_builder(raw.len + 8)
-	for ch in raw {
+	mut i := 0
+	for i < raw.len {
+		ch := raw[i]
+		// V scanner stores escape sequences as raw pairs: `\` + char.
+		// Process them as units to avoid breaking `\\` + `"` sequences.
+		if ch == `\\` && i + 1 < raw.len {
+			next := raw[i + 1]
+			if next == `"` {
+				// V escape \" → emit C escape \" (same representation)
+				sb.write_u8(`\\`)
+				sb.write_u8(`"`)
+				i += 2
+				continue
+			}
+			// All other V escapes (\n, \t, \\, \0, etc.) → pass through as-is
+			sb.write_u8(ch)
+			sb.write_u8(next)
+			i += 2
+			continue
+		}
 		if ch == `"` {
+			// Unescaped " (e.g. from single-quoted V strings) → escape for C
 			sb.write_u8(`\\`)
 			sb.write_u8(`"`)
 		} else if ch == `\r` {
@@ -727,6 +846,7 @@ fn escape_c_string_literal_segment(raw string) string {
 		} else {
 			sb.write_u8(ch)
 		}
+		i++
 	}
 	return sb.str()
 }
@@ -876,8 +996,16 @@ fn (mut g Gen) gen_keyword_operator(node ast.KeywordOperator) {
 			}
 		}
 		.key_typeof {
+			// typeof should be lowered to StringLiteral by the transformer.
+			// Fallback: emit a placeholder string.
 			if node.exprs.len > 0 {
-				type_name := g.expr_type_to_c(node.exprs[0])
+				mut type_name := ''
+				if raw_type := g.get_raw_type(node.exprs[0]) {
+					type_name = g.types_type_to_v(raw_type)
+				}
+				if type_name == '' {
+					type_name = g.expr_type_to_c(node.exprs[0])
+				}
 				g.sb.write_string(c_static_v_string_expr(type_name))
 			} else {
 				g.sb.write_string(c_empty_v_string_expr())

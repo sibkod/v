@@ -40,6 +40,7 @@ pub enum OpCode {
 
 	// Memory
 	alloca
+	heap_alloc // Heap allocate memory for a type (malloc+zero): returns ptr
 	load
 	store
 	get_element_ptr
@@ -57,13 +58,18 @@ pub enum OpCode {
 	sitofp
 	bitcast
 
-	// Comparisons
+	// Comparisons (signed)
 	lt
 	gt
 	le
 	ge
 	eq
 	ne
+	// Comparisons (unsigned)
+	ult
+	ugt
+	ule
+	uge
 
 	// Other
 	phi

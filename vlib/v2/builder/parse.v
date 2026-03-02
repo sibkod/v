@@ -3,6 +3,7 @@
 // that can be found in the LICENSE file.
 module builder
 
+import os
 import v2.ast
 import v2.parser
 
@@ -24,15 +25,28 @@ fn (mut b Builder) parse_files(files []string) []ast.File {
 			ast_files << parsed_core_files
 		} else {
 			for module_path in core_cached_module_paths {
-				module_files := get_v_files_from_dir(b.pref.get_vlib_module_path(module_path),
-					b.pref.user_defines)
+				vlib_path := b.pref.get_vlib_module_path(module_path)
+				module_files := get_v_files_from_dir(vlib_path, b.pref.user_defines)
 				parsed_module_files := parser_reused.parse_files(module_files, mut b.file_set)
 				ast_files << parsed_module_files
 			}
 		}
 	}
+	// For test files, include all non-test sibling module files from the same directory
+	mut all_user_files := files.clone()
+	for file in files {
+		if file.contains('_test.') && file.ends_with('.v') {
+			dir := os.dir(file)
+			sibling_files := get_v_files_from_dir(dir, b.pref.user_defines)
+			for sf in sibling_files {
+				if sf !in all_user_files {
+					all_user_files << sf
+				}
+			}
+		}
+	}
 	// parse user files
-	parsed_user_files := parser_reused.parse_files(files, mut b.file_set)
+	parsed_user_files := parser_reused.parse_files(all_user_files, mut b.file_set)
 	ast_files << parsed_user_files
 	skip_imports := b.pref.skip_imports
 	if skip_imports {

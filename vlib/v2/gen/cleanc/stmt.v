@@ -25,6 +25,9 @@ fn (mut g Gen) gen_stmts(stmts []ast.Stmt) {
 }
 
 fn (mut g Gen) gen_stmt(node ast.Stmt) {
+	if !stmt_has_valid_data(node) {
+		return
+	}
 	match node {
 		ast.FnDecl {
 			g.gen_fn_decl(node)
@@ -211,6 +214,18 @@ fn (mut g Gen) gen_stmt(node ast.Stmt) {
 					g.sb.writeln(';')
 					return
 				}
+				// For CallExpr in result-returning function, check if the called
+				// function also returns the same result type (passthrough).
+				if expr is ast.CallExpr {
+					if call_ret := g.get_call_return_type(expr.lhs, expr.args.len) {
+						if call_ret == g.cur_fn_ret_type {
+							g.sb.write_string('return ')
+							g.expr(expr)
+							g.sb.writeln(';')
+							return
+						}
+					}
+				}
 				if value_type == '' || value_type == 'void' {
 					g.sb.writeln('return (${g.cur_fn_ret_type}){ .is_error=false };')
 					return
@@ -275,7 +290,8 @@ fn (mut g Gen) gen_stmt(node ast.Stmt) {
 		}
 		ast.Directive {
 			g.write_indent()
-			g.sb.writeln('/* [TODO] Directive: #${node.name} ${node.value} */')
+			ct_cond_str := if node.ct_cond.len > 0 { ' ct_cond=${node.ct_cond}' } else { '' }
+			g.sb.writeln('/* [TODO] Directive: #${node.name} ${node.value}${ct_cond_str} */')
 		}
 		ast.ForInStmt {
 			panic('bug in v2 compiler: ForInStmt should have been lowered in v2.transformer')
@@ -284,25 +300,15 @@ fn (mut g Gen) gen_stmt(node ast.Stmt) {
 			panic('bug in v2 compiler: DeferStmt should have been lowered in v2.transformer')
 		}
 		ast.AssertStmt {
-			g.write_indent()
-			g.sb.write_string('if (!(')
-			g.expr(node.expr)
-			g.sb.writeln(')) {')
-			g.indent++
-			g.write_indent()
-			g.sb.writeln('fprintf(stderr, "assert failed\\n");')
-			g.write_indent()
-			g.sb.writeln('exit(1);')
-			g.indent--
-			g.write_indent()
-			g.sb.writeln('}')
+			panic('bug in v2 compiler: AssertStmt should have been lowered in v2.transformer')
 		}
 		ast.ComptimeStmt {
 			panic('bug in v2 compiler: ComptimeStmt should have been handled in v2.transformer')
 		}
 		ast.BlockStmt {
-			g.write_indent()
-			g.sb.writeln('/* [TODO] BlockStmt */')
+			for bs in node.stmts {
+				g.gen_stmt(bs)
+			}
 		}
 		ast.LabelStmt {
 			g.write_indent()

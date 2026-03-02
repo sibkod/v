@@ -17,8 +17,9 @@ mut:
 	file    &token.File = &token.File{}
 	scanner &scanner.Scanner
 	// track state
-	exp_lcbr bool // expecting `{` parsing `x` in `for|if|match x {` etc
-	exp_pt   bool // expecting (p)ossible (t)ype from `p.expr()`
+	exp_lcbr     bool // expecting `{` parsing `x` in `for|if|match x {` etc
+	exp_pt       bool // expecting (p)ossible (t)ype from `p.expr()`
+	in_top_level bool // inside top-level context (file scope / top-level comptime block)
 	// token info : start
 	line      int
 	lit       string
@@ -120,6 +121,7 @@ pub fn (mut p Parser) parse_file(filename string, mut file_set token.FileSet) as
 		imports << import_stmt
 		top_stmts << import_stmt
 	}
+	p.in_top_level = true
 	for p.tok != .eof {
 		top_stmt := p.top_stmt()
 		// if top_stmt is ast.Decl {
@@ -127,6 +129,7 @@ pub fn (mut p Parser) parse_file(filename string, mut file_set token.FileSet) as
 		// }
 		top_stmts << top_stmt
 	}
+	p.in_top_level = false
 	if p.pref.verbose {
 		parse_time := sw.elapsed()
 		println('scan & parse ${filename} (${p.file.line_count()} LOC): ${parse_time.milliseconds()}ms (${parse_time.microseconds()}µs)')
@@ -209,53 +212,58 @@ fn (mut p Parser) top_stmt() ast.Stmt {
 
 fn (mut p Parser) stmt() ast.Stmt {
 	// p.log('STMT: ${p.tok} - ${p.file.name}:${p.line}')
+	// Top-level declarations that can appear inside comptime $if blocks at
+	// file scope. Only parsed when in_top_level is set (file-level context),
+	// not inside regular function bodies where they would be invalid.
+	if p.in_top_level {
+		match p.tok {
+			.key_const {
+				return p.const_decl(false)
+			}
+			.key_enum {
+				return p.enum_decl(false, [])
+			}
+			.key_fn {
+				// `fn name(...)` or `fn C.name(...)` is a declaration;
+				// `fn (recv Type) method(...)` is a method declaration.
+				next := p.peek()
+				if next == .name || next == .lpar {
+					return p.fn_decl(false, [])
+				}
+			}
+			.key_global {
+				return p.global_decl([])
+			}
+			.key_interface {
+				return p.interface_decl(false, [])
+			}
+			.key_pub {
+				p.next()
+				match p.tok {
+					.key_const { return p.const_decl(true) }
+					.key_enum { return p.enum_decl(true, []) }
+					.key_fn { return p.fn_decl(true, []) }
+					.key_interface { return p.interface_decl(true, []) }
+					.key_struct, .key_union { return p.struct_decl(true, []) }
+					.key_type { return p.type_decl(true) }
+					else { p.error('not implemented: pub ${p.tok}') }
+				}
+			}
+			.key_struct, .key_union {
+				return p.struct_decl(false, [])
+			}
+			.key_type {
+				return p.type_decl(false)
+			}
+			else {}
+		}
+	}
 	match p.tok {
 		.dollar {
 			return p.comptime_stmt()
 		}
 		.hash {
 			return p.directive()
-		}
-		// Top-level declarations that can appear inside comptime $if blocks.
-		.key_const {
-			return p.const_decl(false)
-		}
-		.key_enum {
-			return p.enum_decl(false, [])
-		}
-		.key_fn {
-			// `fn name(...)` or `fn C.name(...)` is a declaration;
-			// `fn (...)` or `fn [captures](...)` is a literal (handled by else/expr).
-			if p.peek() == .name {
-				return p.fn_decl(false, [])
-			}
-			// fall through to expression (fn literal)
-			expr := p.expr(.lowest)
-			return p.complete_simple_stmt(expr, false)
-		}
-		.key_global {
-			return p.global_decl([])
-		}
-		.key_interface {
-			return p.interface_decl(false, [])
-		}
-		.key_pub {
-			p.next()
-			match p.tok {
-				.key_const { return p.const_decl(true) }
-				.key_enum { return p.enum_decl(true, []) }
-				.key_fn { return p.fn_decl(true, []) }
-				.key_interface { return p.interface_decl(true, []) }
-				.key_struct, .key_union { return p.struct_decl(true, []) }
-				.key_type { return p.type_decl(true) }
-				else { p.error('not implemented: pub ${p.tok}') }
-			}
-		}
-		.key_struct, .key_union {
-			return p.struct_decl(false, [])
-		}
-		.key_type {
-			return p.type_decl(false)
 		}
 		.key_asm {
 			return p.asm_stmt()
@@ -773,15 +781,20 @@ fn (mut p Parser) expr(min_bp token.BindingPower) ast.Expr {
 				// (`[2]type{}` | `[2][]type{}` | `[2]&type{init: Foo{}}`) | `[2]type`
 				if p.tok in [.amp, .name] {
 					elem_type := p.expect_type()
+					// Build nested type from innermost to outermost dimension.
+					// For `[3][3]int`, exprs_arr = [[3], [3]], and we iterate
+					// from the last (innermost) to first (outermost), nesting
+					// each dimension around the previous one.
+					mut inner_type := ast.Expr(elem_type)
 					for i := exprs_arr.len - 1; i >= 0; i-- {
 						exprs2 := exprs_arr[i]
 						if exprs2.len == 0 {
-							lhs = ast.Expr(ast.Type(ast.ArrayType{
-								elem_type: elem_type
+							inner_type = ast.Expr(ast.Type(ast.ArrayType{
+								elem_type: inner_type
 							}))
 						} else if exprs2.len == 1 {
-							lhs = ast.Expr(ast.Type(ast.ArrayFixedType{
-								elem_type: elem_type
+							inner_type = ast.Expr(ast.Type(ast.ArrayFixedType{
+								elem_type: inner_type
 								len:       exprs2[0]
 							}))
 						} else {
@@ -789,6 +802,7 @@ fn (mut p Parser) expr(min_bp token.BindingPower) ast.Expr {
 							p.error('expecting single expr for fixed array length')
 						}
 					}
+					lhs = inner_type
 					// `[2]type{}`
 					if p.tok == .lcbr && !p.exp_lcbr {
 						p.next()
@@ -1848,6 +1862,16 @@ fn (mut p Parser) directive() ast.Directive {
 	// TODO: handle properly
 	// NOTE: these line checks will be removed once this is parsed properly
 	// and only needed since auto semi is not inserted after `>`
+	// Detect OS-specific conditions like `#include linux <pty.h>` or `#include darwin "util.h"`.
+	// When the directive is an include variant and the next token is a name followed by '<' or '"',
+	// the name is an OS/platform condition.
+	mut ct_cond := ''
+	if name in ['include', 'preinclude', 'postinclude', 'insert'] && p.tok == .name {
+		next := p.peek()
+		if next == .lt || next == .string {
+			ct_cond = p.lit()
+		}
+	}
 	mut value := p.lit()
 	for p.line == line {
 		if p.tok == .name {
@@ -1859,8 +1883,9 @@ fn (mut p Parser) directive() ast.Directive {
 	}
 	// p.next()
 	return ast.Directive{
-		name:  name
-		value: value
+		name:    name
+		value:   value
+		ct_cond: ct_cond
 	}
 }
 
@@ -1960,11 +1985,14 @@ fn (mut p Parser) fn_decl(is_public bool, attributes []ast.Attribute) ast.FnDecl
 			if p.tok != .lcbr {
 				return_type = p.expect_type()
 			}
+			prev_top_level := p.in_top_level
+			p.in_top_level = false
 			stmts := if p.tok == .lcbr {
 				p.block()
 			} else {
 				[]ast.Stmt{}
 			}
+			p.in_top_level = prev_top_level
 			p.expect(.semicolon)
 			return ast.FnDecl{
 				attributes: attributes
@@ -2010,11 +2038,14 @@ fn (mut p Parser) fn_decl(is_public bool, attributes []ast.Attribute) ast.FnDecl
 	typ := p.fn_type()
 	// p.log('ast.FnDecl: ${name} ${p.lit} - ${p.tok} (${p.lit}) - ${p.tok_next_}')
 	// also check line for better error detection
+	prev_top_level := p.in_top_level
+	p.in_top_level = false
 	stmts := if p.tok == .lcbr {
 		p.block()
 	} else {
 		[]ast.Stmt{}
 	}
+	p.in_top_level = prev_top_level
 	p.expect(.semicolon)
 	return ast.FnDecl{
 		attributes: attributes

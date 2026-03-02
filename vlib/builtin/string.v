@@ -339,7 +339,7 @@ fn (a string) option_clone_static() ?string {
 
 // clone returns a copy of the V string `a`.
 pub fn (a string) clone() string {
-	if a.len <= 0 {
+	if a.len <= 0 || u64(a.str) <= 0xFFFF {
 		return ''
 	}
 	mut b := string{
@@ -783,8 +783,9 @@ pub fn (s string) parse_int(_base int, _bit_size int) !i64 {
 @[direct_array_access]
 fn (s string) == (a string) bool {
 	if s.str == 0 {
-		// should never happen
-		panic('string.eq(): nil string')
+		// Nil string: equal only to another nil/empty string.
+		// This can happen with zero-initialized struct fields in the native backend.
+		return a.str == 0 || a.len == 0
 	}
 	if s.len != a.len {
 		return false
@@ -832,16 +833,20 @@ fn (s string) < (a string) bool {
 
 @[direct_array_access]
 fn (s string) + (a string) string {
-	new_len := a.len + s.len
+	slen := if s.len > 0 && u64(s.str) > 0xFFFF { s.len } else { 0 }
+	alen := if a.len > 0 && u64(a.str) > 0xFFFF { a.len } else { 0 }
+	new_len := alen + slen
 	mut res := string{
 		str: unsafe { malloc_noscan(new_len + 1) }
 		len: new_len
 	}
 	unsafe {
-		vmemcpy(res.str, s.str, s.len)
-		vmemcpy(res.str + s.len, a.str, a.len)
-	}
-	unsafe {
+		if slen > 0 {
+			vmemcpy(res.str, s.str, slen)
+		}
+		if alen > 0 {
+			vmemcpy(res.str + slen, a.str, alen)
+		}
 		res.str[new_len] = 0 // V strings are not null terminated, but just in case
 	}
 	return res
@@ -850,17 +855,24 @@ fn (s string) + (a string) string {
 // for `s + s2 + s3`, an optimization (faster than string_plus(string_plus(s1, s2), s3))
 @[direct_array_access]
 fn (s string) plus_two(a string, b string) string {
-	new_len := a.len + b.len + s.len
+	slen := if s.len > 0 && u64(s.str) > 0xFFFF { s.len } else { 0 }
+	alen := if a.len > 0 && u64(a.str) > 0xFFFF { a.len } else { 0 }
+	blen := if b.len > 0 && u64(b.str) > 0xFFFF { b.len } else { 0 }
+	new_len := alen + blen + slen
 	mut res := string{
 		str: unsafe { malloc_noscan(new_len + 1) }
 		len: new_len
 	}
 	unsafe {
-		vmemcpy(res.str, s.str, s.len)
-		vmemcpy(res.str + s.len, a.str, a.len)
-		vmemcpy(res.str + s.len + a.len, b.str, b.len)
-	}
-	unsafe {
+		if slen > 0 {
+			vmemcpy(res.str, s.str, slen)
+		}
+		if alen > 0 {
+			vmemcpy(res.str + slen, a.str, alen)
+		}
+		if blen > 0 {
+			vmemcpy(res.str + slen + alen, b.str, blen)
+		}
 		res.str[new_len] = 0 // V strings are not null terminated, but just in case
 	}
 	return res
@@ -1196,6 +1208,17 @@ pub fn (s string) substr_unsafe(start int, _end int) string {
 	}
 }
 
+// substr_or returns substr(start, end) if bounds are valid, otherwise returns fallback.
+// Used by the native backend for `s[start..end] or { fallback }` expressions.
+@[direct_array_access]
+pub fn (s string) substr_or(start int, _end int, fallback string) string {
+	end := if _end == max_i64 || _end == max_i32 { s.len } else { _end }
+	if start < 0 || start > end || end > s.len {
+		return fallback
+	}
+	return s.substr(start, end)
+}
+
 // version of `substr()` that is used in `a[start..end] or {`
 // return an error when the index is out of range
 @[direct_array_access]
@@ -1269,7 +1292,7 @@ pub fn (s string) substr_ni(_start int, _end int) string {
 // It will return `-1` if the input string can't be found.
 @[direct_array_access]
 pub fn (s string) index_(p string) int {
-	if p.len > s.len || p.len == 0 {
+	if p.len > s.len || p.len == 0 || u64(s.str) <= 0xFFFF || u64(p.str) <= 0xFFFF {
 		return -1
 	}
 	if p.len > 2 {
@@ -1572,7 +1595,7 @@ pub fn (s string) contains_any_substr(substrs []string) bool {
 // starts_with returns `true` if the string starts with `p`.
 @[direct_array_access]
 pub fn (s string) starts_with(p string) bool {
-	if p.len > s.len {
+	if p.len > s.len || u64(s.str) <= 0xFFFF || u64(p.str) <= 0xFFFF {
 		return false
 	} else if unsafe { vmemcmp(s.str, p.str, p.len) == 0 } {
 		return true
@@ -1583,7 +1606,7 @@ pub fn (s string) starts_with(p string) bool {
 // ends_with returns `true` if the string ends with `p`.
 @[direct_array_access]
 pub fn (s string) ends_with(p string) bool {
-	if p.len > s.len {
+	if p.len > s.len || u64(s.str) <= 0xFFFF || u64(p.str) <= 0xFFFF {
 		return false
 	} else if unsafe { vmemcmp(s.str + s.len - p.len, p.str, p.len) == 0 } {
 		return true
@@ -1904,13 +1927,14 @@ fn (s string) trim_chars(cutset string, mode TrimMode) string {
 @[direct_array_access]
 fn (s string) trim_runes(cutset string, mode TrimMode) string {
 	s_runes := s.runes()
+	cs_runes := cutset.runes()
 	mut pos_left := 0
 	mut pos_right := s_runes.len - 1
 	mut cs_match := true
 	for pos_left <= s_runes.len && pos_right >= -1 && cs_match {
 		cs_match = false
 		if mode in [.trim_left, .trim_both] {
-			for cs in cutset.runes_iterator() {
+			for cs in cs_runes {
 				if s_runes[pos_left] == cs {
 					pos_left++
 					cs_match = true
@@ -1919,7 +1943,7 @@ fn (s string) trim_runes(cutset string, mode TrimMode) string {
 			}
 		}
 		if mode in [.trim_right, .trim_both] {
-			for cs in cutset.runes_iterator() {
+			for cs in cs_runes {
 				if s_runes[pos_right] == cs {
 					pos_right--
 					cs_match = true
@@ -2167,8 +2191,8 @@ pub fn (str string) is_hex() bool {
 	for i < str.len {
 		// TODO: remove this workaround for v2's parser
 		// vfmt off
-		if (str[i] < `0` || str[i] > `9`) && 
-		    ((str[i] < `a` || str[i] > `f`) && (str[i] < `A` || str[i] > `F`)) {
+		if (str[i] < `0` || str[i] > `9`)
+		    && ((str[i] < `a` || str[i] > `f`) && (str[i] < `A` || str[i] > `F`)) {
 			return false
 		}
 		// vfmt on
@@ -2844,7 +2868,9 @@ pub fn (s string) is_identifier() bool {
 // Example: assert 'Abcd'.camel_to_snake() == 'abcd'
 // Example: assert 'aaBB'.camel_to_snake() == 'aa_bb'
 // Example: assert 'BBaa'.camel_to_snake() == 'bb_aa'
-// Example: assert 'aa_BB'.camel_to_snake() == 'aa_bb'
+// Example: assert 'HTTPServer'.camel_to_snake() == 'http_server'
+// Example: assert 'HTTP2Server'.camel_to_snake() == 'http2_server'
+// Example: assert 'XML2JSON'.camel_to_snake() == 'xml_2_json'
 @[direct_array_access]
 pub fn (s string) camel_to_snake() string {
 	if s.len == 0 {
@@ -2858,6 +2884,7 @@ pub fn (s string) camel_to_snake() string {
 	// handle the first two chars separately to reduce load.
 	mut pos := 2
 	mut prev_is_upper := false
+	mut prev_inserted_boundary := false
 	unsafe {
 		if s[0].is_capital() {
 			b[0] = s[0] + 32
@@ -2884,14 +2911,31 @@ pub fn (s string) camel_to_snake() string {
 		}
 	}
 	for i := 2; i < s.len; i++ {
+		mut has_boundary_before_upper := false
 		c := s[i]
 		c_is_upper := c.is_capital()
+		c_is_number := c.is_digit()
+		next_is_lower := i + 1 < s.len && s[i + 1].is_letter() && !s[i + 1].is_capital()
+		next2_is_lower := i + 2 < s.len && s[i + 2].is_letter() && !s[i + 2].is_capital()
+		// Cases: `XML2JSON == xml_2_json` || `HTTP2Server == http2_server`
+		skip_digit := c_is_number && prev_is_upper && !next_is_lower && next2_is_lower
+		// Cases: `HTTPServer == http_server` || `getHTTPSUrl == get_https_url`
+		if c_is_upper && prev_is_upper && i >= 2 && s[i - 2].is_capital() && next_is_lower
+			&& c != `_` {
+			unsafe {
+				if b[pos - 1] != `_` {
+					b[pos] = `_`
+					pos++
+				}
+			}
+			has_boundary_before_upper = true
+		}
 		// Cases: `aBcd == a_bcd` || `ABcd == ab_cd`
 		// TODO: remove this workaround for v2's parser
 		// vfmt off
 		if ((c_is_upper && !prev_is_upper) ||
-			(!c_is_upper && prev_is_upper && s[i - 2].is_capital())) && 
-			c != `_` {
+			(!c_is_upper && prev_is_upper && s[i - 2].is_capital() && !prev_inserted_boundary && !skip_digit))
+			&& c != `_` {
 			unsafe {
 				if b[pos - 1] != `_` {
 					b[pos] = `_`
@@ -2905,6 +2949,7 @@ pub fn (s string) camel_to_snake() string {
 			b[pos] = lower_c
 		}
 		prev_is_upper = c_is_upper
+		prev_inserted_boundary = has_boundary_before_upper
 		pos++
 	}
 	unsafe {

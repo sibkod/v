@@ -11,6 +11,33 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 	lhs := node.lhs[0]
 	rhs := node.rhs[0]
 
+	// Multi-assignment with parallel RHS values (non-declaration):
+	// `p, q = q, p` needs temp variables for correct swap semantics.
+	if node.op != .decl_assign && node.lhs.len > 1 && node.rhs.len == node.lhs.len {
+		// First, evaluate all RHS values into temporaries
+		for i, rhs_expr in node.rhs {
+			mut typ := g.get_expr_type(rhs_expr)
+			if typ == '' || typ == 'int_literal' {
+				typ = 'int'
+			}
+			if typ == 'float_literal' {
+				typ = 'f64'
+			}
+			g.write_indent()
+			g.sb.write_string('${typ} _swap_${g.tmp_counter}_${i} = ')
+			g.expr(rhs_expr)
+			g.sb.writeln(';')
+		}
+		// Then assign from temporaries to LHS
+		for i, lhs_expr in node.lhs {
+			g.write_indent()
+			g.expr(lhs_expr)
+			g.sb.writeln(' = _swap_${g.tmp_counter}_${i};')
+		}
+		g.tmp_counter++
+		return
+	}
+
 	// Multi-declaration with parallel RHS values:
 	// `a, b := x, y` should declare both variables (not just the first one).
 	if node.op == .decl_assign && node.lhs.len > 1 && node.rhs.len == node.lhs.len {
@@ -200,7 +227,12 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 				g.sb.write_string('${elem_type} ${name}[')
 				g.expr(fixed_typ.len)
 				if array_init.exprs.len == 0 {
-					if is_literal_size {
+					if array_init.init !is ast.EmptyExpr && is_literal_size {
+						// Has init: clause - expand to repeated init values
+						g.sb.write_string('] = ')
+						g.gen_array_init_expr(array_init)
+						g.sb.writeln(';')
+					} else if is_literal_size {
 						g.sb.writeln('] = {0};')
 					} else {
 						// Non-literal sizes are VLAs in C99 and cannot use = {0}
@@ -221,6 +253,27 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 			}
 		}
 		mut typ := g.get_expr_type(rhs)
+		// For temp variables registered by the transformer with a specific type,
+		// prefer the scope-registered type over the RHS expression type.
+		if name.starts_with('_or_t') || name.starts_with('_tmp_') {
+			if raw_type := g.get_raw_type(lhs) {
+				scope_type := g.types_type_to_c(raw_type)
+				if scope_type != '' && scope_type != 'int' {
+					typ = scope_type
+				} else if scope_type == 'int' && typ == 'bool' {
+					// Fix: literal like `1` mistyped as bool in env
+					typ = 'int'
+				}
+			}
+		}
+		// Fix: &T(x) pattern - the checker may assign only the inner type T instead of T*.
+		// Derive the pointer type directly from the expression structure.
+		if rhs is ast.PrefixExpr && rhs.op == .amp && rhs.expr is ast.CastExpr {
+			target_type := g.expr_type_to_c(rhs.expr.typ)
+			if target_type != '' {
+				typ = target_type + '*'
+			}
+		}
 		mut elem_type_from_array := false
 		if rhs is ast.CallExpr {
 			if rhs.lhs is ast.Ident
@@ -290,7 +343,7 @@ fn (mut g Gen) gen_assign_stmt(node ast.AssignStmt) {
 						scoped_type := g.types_type_to_c(obj_type)
 						if (typ == '' || typ == 'int' || typ == 'int_literal' || typ == 'void*'
 							|| typ == 'voidptr') && scoped_type != ''
-							&& scoped_type !in ['int', 'void'] {
+							&& scoped_type !in ['int', 'void', 'void*', 'voidptr'] {
 							typ = scoped_type
 						}
 					}

@@ -124,9 +124,18 @@ fn (mut t Transformer) apply_smartcast_field_access_ctx(sumtype_expr ast.Expr, f
 	if t.expr_is_casted_to_type(transformed_base, mangled_variant) {
 		return t.synth_selector_from_struct(transformed_base, field_name, mangled_variant)
 	}
-	// Create: transformed_base._data._variant (using simple name for accessor)
+	// Create data access.
+	// For native backends (arm64/x64): _data is a plain i64 (void pointer) in the SSA struct.
+	// No union variant sub-field exists, so just use _data directly.
+	// For C backends: _data is a union, so access _data._variant for the specific member.
+	is_native_backend := t.pref != unsafe { nil }
+		&& (t.pref.backend == .arm64 || t.pref.backend == .x64)
 	data_access := t.synth_selector(transformed_base, '_data', types.Type(types.voidptr_))
-	variant_access := t.synth_selector(data_access, '_${variant_simple}', types.Type(types.voidptr_))
+	variant_access := if is_native_backend {
+		data_access
+	} else {
+		t.synth_selector(data_access, '_${variant_simple}', types.Type(types.voidptr_))
+	}
 	// Create: (mangled_variant*)variant_access
 	cast_expr := ast.CastExpr{
 		typ:  ast.Ident{
@@ -223,7 +232,7 @@ fn (mut t Transformer) transform_array_init_expr(expr ast.ArrayInitExpr) ast.Exp
 				value: '0'
 			})
 		})
-		init_expr := ast.Expr(if expr.init !is ast.EmptyExpr {
+		mut init_expr := ast.Expr(if expr.init !is ast.EmptyExpr {
 			t.transform_expr(expr.init)
 		} else {
 			ast.Expr(ast.Ident{
@@ -234,6 +243,87 @@ fn (mut t Transformer) transform_array_init_expr(expr ast.ArrayInitExpr) ast.Exp
 		if expr.init !is ast.EmptyExpr && t.expr_contains_ident_named(init_expr, 'index') {
 			return t.expand_array_init_with_index(len_expr, cap_expr, sizeof_expr, init_expr,
 				expr.pos)
+		}
+		// When element type is a reference type (array or map) and no explicit init,
+		// synthesize a proper default so inner elements get initialized correctly
+		// (not zero-filled via NULL, which leaves element_size=0 or hash_fn=null).
+		// sizeof_expr holds elem_type_expr before smartcasting, so use it to avoid issues.
+		elem_is_nested_array := elem_type_expr is ast.Type && elem_type_expr is ast.ArrayType
+		elem_is_map := elem_type_expr is ast.Type && elem_type_expr is ast.MapType
+		if expr.init is ast.EmptyExpr && elem_is_nested_array {
+			init_expr = ast.Expr(t.transform_array_init_expr(ast.ArrayInitExpr{
+				typ: sizeof_expr
+			}))
+		}
+		if expr.init is ast.EmptyExpr && elem_is_map {
+			init_expr = ast.Expr(t.transform_map_init_expr(ast.MapInitExpr{
+				typ: sizeof_expr
+			}))
+		}
+		// When element type is a struct with map fields and no explicit init,
+		// synthesize a struct default and use for-loop expansion so each element
+		// gets its own map allocation (memcpy would share internal pointers).
+		if expr.init is ast.EmptyExpr && !elem_is_nested_array && !elem_is_map {
+			if elem_type := t.get_expr_type(elem_type_expr) {
+				elem_base := t.unwrap_alias_and_pointer_type(elem_type)
+				if elem_base is types.Struct {
+					mut field_inits := []ast.FieldInit{}
+					for field in elem_base.fields {
+						if field.typ is types.Map {
+							map_type_expr := t.type_to_ast_type_expr(field.typ)
+							map_init := t.transform_map_init_expr(ast.MapInitExpr{
+								typ: map_type_expr
+							})
+							field_inits << ast.FieldInit{
+								name:  field.name
+								value: map_init
+							}
+						}
+					}
+					if field_inits.len > 0 {
+						struct_init := ast.Expr(ast.InitExpr{
+							typ:    elem_type_expr
+							fields: field_inits
+						})
+						return t.expand_array_init_with_index(len_expr, cap_expr, sizeof_expr,
+							struct_init, expr.pos)
+					}
+				}
+			}
+		}
+		// When init value is an array, use __new_array_with_array_default for deep cloning
+		// (shallow memcpy would share data pointers between all elements)
+		mut init_is_array := expr.init is ast.ArrayInitExpr
+		if !init_is_array && elem_is_nested_array && expr.init is ast.EmptyExpr {
+			init_is_array = true
+		}
+		if !init_is_array {
+			if init_type := t.get_expr_type(expr.init) {
+				init_base := t.unwrap_alias_and_pointer_type(init_type)
+				init_is_array = init_base is types.Array
+			}
+		}
+		if init_is_array {
+			return ast.CallExpr{
+				lhs:  ast.Ident{
+					name: '__new_array_with_array_default'
+				}
+				args: [
+					len_expr,
+					cap_expr,
+					ast.Expr(ast.KeywordOperator{
+						op:    .key_sizeof
+						exprs: [sizeof_expr]
+					}),
+					init_expr,
+					// depth parameter for clone_to_depth
+					ast.Expr(ast.BasicLiteral{
+						kind:  .number
+						value: '3'
+					}),
+				]
+				pos:  expr.pos
+			}
 		}
 		return ast.CallExpr{
 			lhs:  ast.Ident{
@@ -478,9 +568,17 @@ fn (mut t Transformer) transform_array_init_expr(expr ast.ArrayInitExpr) ast.Exp
 				} else if first.lhs is ast.SelectorExpr {
 					fn_name = first.lhs.rhs.name
 				}
-				// String methods that return string
-				if fn_name in ['substr', 'substr_unsafe', 'trim', 'trim_left', 'trim_right',
+				// Dynamic array construction functions return 'array' type
+				if fn_name in ['builtin__new_array_from_c_array_noscan',
+					'builtin__new_array_from_c_array', '__new_array_with_default_noscan',
+					'new_array_from_c_array'] {
+					elem_type_name = 'array'
+					ast.Expr(ast.Ident{
+						name: 'array'
+					})
+				} else if fn_name in ['substr', 'substr_unsafe', 'trim', 'trim_left', 'trim_right',
 					'to_upper', 'to_lower', 'replace', 'reverse', 'clone', 'repeat'] {
+					// String methods that return string
 					elem_type_name = 'string'
 					ast.Expr(ast.Ident{
 						name: 'string'
@@ -1047,15 +1145,34 @@ fn (mut t Transformer) add_missing_struct_field_defaults(struct_name string, fie
 	if struct_name == '' {
 		return fields
 	}
-	struct_type := t.lookup_type(struct_name) or { return fields }
+	struct_type := t.lookup_type(struct_name) or {
+		if struct_name.contains('Scope') || struct_name.contains('DenseArray')
+			|| struct_name.contains('Env') {
+			eprintln('DIAG add_missing_defaults: FAILED lookup for "${struct_name}"')
+		}
+		return fields
+	}
 	base_type := t.unwrap_alias_and_pointer_type(struct_type)
 	if base_type !is types.Struct {
+		if struct_name.contains('Scope') || struct_name.contains('DenseArray')
+			|| struct_name.contains('Env') {
+			eprintln('DIAG add_missing_defaults: NOT struct for "${struct_name}" type=${base_type.type_name()}')
+		}
 		return fields
 	}
 	struct_info := base_type as types.Struct
 	mut existing := map[string]bool{}
+	mut positional_idx := 0
 	for field in fields {
-		existing[field.name] = true
+		if field.name == '' {
+			// Positional field — map it to the corresponding struct field name
+			if positional_idx < struct_info.fields.len {
+				existing[struct_info.fields[positional_idx].name] = true
+			}
+			positional_idx++
+		} else {
+			existing[field.name] = true
+		}
 	}
 	mut out := []ast.FieldInit{cap: fields.len}
 	for field in fields {
@@ -1077,6 +1194,9 @@ fn (mut t Transformer) add_missing_struct_field_defaults(struct_name string, fie
 		}
 		field_type := t.unwrap_alias_and_pointer_type(struct_field.typ)
 		if field_type is types.Map {
+			if struct_name.contains('Scope') || struct_name.contains('Env') {
+				eprintln('DIAG add_missing_defaults: adding map default for "${struct_name}.${struct_field.name}"')
+			}
 			map_init := ast.Expr(ast.MapInitExpr{
 				typ: t.type_to_ast_type_expr(field_type)
 			})
@@ -1512,14 +1632,16 @@ fn (mut t Transformer) expand_array_init_with_index(len_expr ast.Expr, cap_expr 
 	//    with `index` renamed to `_v_index`
 	renamed_init := t.replace_ident_named(init_expr, 'index', '_v_index')
 	arr_data := t.synth_selector(arr_ident, 'data', types.Type(types.voidptr_))
+	// Use a simple Ident for the cast type name so cleanc renders it as
+	// ((ElemType*)data)[idx] without decomposing compound type expressions.
+	cast_type_name := t.expr_to_type_name(sizeof_expr)
 	elem_assign := ast.Stmt(ast.AssignStmt{
 		op:  .assign
 		lhs: [
 			ast.Expr(ast.IndexExpr{
 				lhs:  ast.CastExpr{
-					typ:  ast.PrefixExpr{
-						op:   .amp
-						expr: sizeof_expr
+					typ:  ast.Ident{
+						name: '${cast_type_name}*'
 					}
 					expr: arr_data
 				}

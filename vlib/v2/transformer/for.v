@@ -86,33 +86,37 @@ fn (mut t Transformer) try_expand_for_in_map(stmt ast.ForStmt) ?[]ast.Stmt {
 		name: delta_name
 	}
 
-	// Transform the map expression and store in temp variable to avoid multiple evaluations
+	// Transform the map expression
 	map_expr := t.transform_expr(for_in.expr)
 
-	// Generate temp name for the map to avoid re-evaluating the map expression multiple times
-	map_tmp_name := t.gen_map_iter_temp_name('map')
-	map_tmp_ident := ast.Ident{
-		name: map_tmp_name
+	// For lvalue expressions (simple Ident or SelectorExpr), use the original
+	// directly so mutations during iteration (delete/set) are visible.
+	// For rvalue expressions (function calls, map literals), store in a temp variable.
+	is_lvalue := map_expr is ast.Ident || map_expr is ast.SelectorExpr
+	mut map_ref := map_expr
+	mut stmts := []ast.Stmt{}
+	if !is_lvalue {
+		map_tmp_name := t.gen_map_iter_temp_name('map')
+		map_tmp_ident := ast.Ident{
+			name: map_tmp_name
+		}
+		stmts << ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(map_tmp_ident)]
+			rhs: [ast.Expr(map_expr)]
+		}
+		map_ref = ast.Expr(map_tmp_ident)
 	}
 
-	// key_values selector: _map_tmp.key_values
-	key_values_expr := t.synth_selector(map_tmp_ident, 'key_values', types.Type(types.Struct{
+	// key_values selector: map_ref.key_values
+	key_values_expr := t.synth_selector(map_ref, 'key_values', types.Type(types.Struct{
 		name: 'DenseArray'
 	}))
 
-	// key_values.len selector: map_expr.key_values.len
+	// key_values.len selector: map_ref.key_values.len
 	key_values_len_expr := t.synth_selector(ast.Expr(key_values_expr), 'len', types.Type(types.int_))
 
-	mut stmts := []ast.Stmt{}
-
-	// 0. _map_tmp := map_expr (store map in temp variable to avoid re-evaluation)
-	stmts << ast.AssignStmt{
-		op:  .decl_assign
-		lhs: [ast.Expr(map_tmp_ident)]
-		rhs: [ast.Expr(map_expr)]
-	}
-
-	// 1. mut _map_len := _map_tmp.key_values.len
+	// 1. mut _map_len := map_ref.key_values.len
 	stmts << ast.AssignStmt{
 		op:  .decl_assign
 		lhs: [ast.Expr(ast.ModifierExpr{
@@ -234,6 +238,26 @@ fn (mut t Transformer) try_expand_for_in_map(stmt ast.ForStmt) ?[]ast.Stmt {
 				name: key_name
 			})]
 			rhs: [ast.Expr(key_deref)]
+		}
+		// Clone string keys to avoid use-after-free when map mutations
+		// (delete/set) free the underlying string data during iteration.
+		if map_type.key_type is types.String {
+			loop_body << ast.AssignStmt{
+				op:  .assign
+				lhs: [ast.Expr(ast.Ident{
+					name: key_name
+				})]
+				rhs: [
+					ast.Expr(ast.CallExpr{
+						lhs:  ast.Ident{
+							name: 'string__clone'
+						}
+						args: [ast.Expr(ast.Ident{
+							name: key_name
+						})]
+					}),
+				]
+			}
 		}
 		// Register key variable type in scope for later string detection
 		t.scope.insert(key_name, map_type.key_type)
@@ -451,6 +475,7 @@ fn (mut t Transformer) transform_untyped_for_in(stmt ast.ForStmt, for_in ast.For
 	mut value_lhs := ast.Expr(ast.Ident{
 		name: value_name
 	})
+	mut is_mut_value := false
 	if for_in.value is ast.Ident {
 		value_name = for_in.value.name
 		value_lhs = ast.Expr(for_in.value)
@@ -458,6 +483,9 @@ fn (mut t Transformer) transform_untyped_for_in(stmt ast.ForStmt, for_in ast.For
 		if for_in.value.expr is ast.Ident {
 			value_name = for_in.value.expr.name
 			value_lhs = ast.Expr(for_in.value.expr)
+			if for_in.value.kind == .key_mut {
+				is_mut_value = true
+			}
 		}
 	}
 
@@ -481,17 +509,24 @@ fn (mut t Transformer) transform_untyped_for_in(stmt ast.ForStmt, for_in ast.For
 	}
 	transformed_expr := t.transform_expr(for_in.expr)
 
+	index_expr := ast.Expr(ast.IndexExpr{
+		lhs:  transformed_expr
+		expr: ast.Ident{
+			name: key_name
+		}
+	})
+	value_rhs := if is_mut_value {
+		ast.Expr(ast.PrefixExpr{
+			op:   .amp
+			expr: index_expr
+		})
+	} else {
+		index_expr
+	}
 	value_assign := ast.AssignStmt{
 		op:  .decl_assign
 		lhs: [value_lhs]
-		rhs: [
-			ast.Expr(ast.IndexExpr{
-				lhs:  transformed_expr
-				expr: ast.Ident{
-					name: key_name
-				}
-			}),
-		]
+		rhs: [value_rhs]
 	}
 
 	mut new_stmts := []ast.Stmt{cap: stmt.stmts.len + 1}
@@ -553,6 +588,7 @@ fn (mut t Transformer) transform_array_for_in(stmt ast.ForStmt, for_in ast.ForIn
 	mut value_lhs := ast.Expr(ast.Ident{
 		name: value_name
 	})
+	mut is_mut_value := false
 	if for_in.value is ast.Ident {
 		value_name = for_in.value.name
 		value_lhs = ast.Expr(for_in.value)
@@ -560,6 +596,9 @@ fn (mut t Transformer) transform_array_for_in(stmt ast.ForStmt, for_in ast.ForIn
 		if for_in.value.expr is ast.Ident {
 			value_name = for_in.value.expr.name
 			value_lhs = ast.Expr(for_in.value.expr)
+			if for_in.value.kind == .key_mut {
+				is_mut_value = true
+			}
 		}
 	}
 
@@ -586,18 +625,26 @@ fn (mut t Transformer) transform_array_for_in(stmt ast.ForStmt, for_in ast.ForIn
 
 	transformed_expr := t.transform_expr(for_in.expr)
 
-	// Build: elem := arr[_idx]
+	// Build: elem := arr[_idx] (or elem := &arr[_idx] for mut)
+	index_expr := ast.Expr(ast.IndexExpr{
+		lhs:  transformed_expr
+		expr: ast.Ident{
+			name: key_name
+		}
+	})
+	value_rhs := if is_mut_value {
+		// mut loop variable: take address for in-place mutation
+		ast.Expr(ast.PrefixExpr{
+			op:   .amp
+			expr: index_expr
+		})
+	} else {
+		index_expr
+	}
 	value_assign := ast.AssignStmt{
 		op:  .decl_assign
 		lhs: [value_lhs]
-		rhs: [
-			ast.Expr(ast.IndexExpr{
-				lhs:  transformed_expr
-				expr: ast.Ident{
-					name: key_name
-				}
-			}),
-		]
+		rhs: [value_rhs]
 	}
 
 	mut new_stmts := []ast.Stmt{cap: stmt.stmts.len + 1}

@@ -168,6 +168,16 @@ fn (t &Transformer) is_callable_type(typ types.Type) bool {
 	}
 }
 
+// is_fn_ident checks if an Ident refers to a function (for detecting function pointer args
+// in .filter()/.map() calls, e.g., arr.filter(my_predicate))
+fn (t &Transformer) is_fn_ident(ident ast.Ident) bool {
+	if typ := t.get_expr_type(ident) {
+		return t.is_callable_type(typ)
+	}
+	// Fallback: check if the name exists as a registered function
+	return t.env.lookup_fn('', ident.name) != none || t.env.lookup_fn('builtin', ident.name) != none
+}
+
 // is_interface_type checks if a type is an Interface
 fn (t &Transformer) is_interface_type_check(typ types.Type) bool {
 	return typ is types.Interface
@@ -301,6 +311,48 @@ fn (t &Transformer) find_sumtype_for_variant(variant_name string) string {
 			}
 		}
 	}
+	// Fallback: search sum types in the current module scope for user-defined types.
+	// Only search the current module to avoid cross-module matches that would
+	// incorrectly trigger smartcasting (e.g., types.Type containing Alias).
+	cur_mod := t.cur_module
+	scope := t.get_module_scope(cur_mod) or { return '' }
+	for obj_name, obj in scope.objects {
+		if obj is types.Type {
+			if obj is types.SumType {
+				st_name := if cur_mod != '' && cur_mod != 'main' && cur_mod != 'builtin' {
+					'${cur_mod}__${obj_name}'
+				} else {
+					obj_name
+				}
+				variants := t.get_sum_type_variants(st_name)
+				if variants.len == 0 {
+					// Try short name if qualified name didn't work
+					inner_variants := t.get_sum_type_variants(obj_name)
+					for v in inner_variants {
+						v_short := if v.contains('__') {
+							v.all_after_last('__')
+						} else {
+							v
+						}
+						if v == variant_name || v_short == short_variant || v_short == variant_name {
+							return obj_name
+						}
+					}
+					continue
+				}
+				for v in variants {
+					v_short := if v.contains('__') {
+						v.all_after_last('__')
+					} else {
+						v
+					}
+					if v == variant_name || v_short == short_variant || v_short == variant_name {
+						return st_name
+					}
+				}
+			}
+		}
+	}
 	return ''
 }
 
@@ -349,6 +401,9 @@ fn (t &Transformer) get_var_type_name(name string) string {
 	}
 	// Some malformed/self-host transitional types can carry incomplete payloads.
 	// Avoid forcing `Type.name()` on those values here.
+	// Note: SumType is intentionally not handled here to avoid triggering
+	// incorrect smartcasting for variables of sum type (e.g. types.Type).
+	// Use get_sumtype_name_for_expr() for sum type name resolution.
 	return ''
 }
 
@@ -930,7 +985,7 @@ fn (t &Transformer) get_sumtype_name_for_expr(expr ast.Expr) string {
 
 	// If scope lookup failed, try to get the type from the expression's position
 	// This handles loop variables and other cases where the scope doesn't have the type
-	if type_name == '' {
+	if type_name == '' && expr_has_valid_data(unwrapped_expr) {
 		if typ := t.env.get_expr_type(unwrapped_expr.pos().id) {
 			type_name = typ.name()
 		}
@@ -1199,8 +1254,23 @@ fn (t &Transformer) build_sumtype_init(transformed_value ast.Expr, variant_name 
 
 	// Create the sum type initialization with _data._variant field name
 	// This generates: (SumType){._tag = N, ._data._variant = (void*)...}
-	// Use short variant name for the C field (e.g., "InfixExpr" not "ast__InfixExpr")
-	short_variant := if variant_name.contains('__') {
+	// Convert variant name to C field name matching the union declaration:
+	// - "ast__InfixExpr" → "InfixExpr" (strip module prefix)
+	// - "[]ast__Attribute" → "Array_ast__Attribute" (array variant)
+	// - "map[K]V" → "Map_K_V" (map variant)
+	short_variant := if variant_name.starts_with('[]') {
+		'Array_${variant_name[2..]}'
+	} else if variant_name.starts_with('map[') {
+		// map[K]V → Map_K_V
+		inner := variant_name[4..] // after 'map['
+		if bracket_idx := inner.index(']') {
+			key := inner[..bracket_idx]
+			val := inner[bracket_idx + 1..]
+			'Map_${key}_${val}'
+		} else {
+			variant_name
+		}
+	} else if variant_name.contains('__') {
 		variant_name.all_after_last('__')
 	} else {
 		variant_name
@@ -1350,17 +1420,161 @@ fn (t &Transformer) get_module_scope(module_name string) ?&types.Scope {
 	return none
 }
 
+// resolve_module_name resolves a module alias to its real module name via scope lookup.
+// Returns the full module name (e.g., 'rand' for alias 'rand', 'seed' for sub-module 'seed').
+fn (t &Transformer) resolve_module_name(name string) ?string {
+	if t.scope != unsafe { nil } {
+		mut scope := unsafe { t.scope }
+		if obj := scope.lookup_parent(name, 0) {
+			if obj is types.Module {
+				mod := unsafe { &types.Module(&obj) }
+				if mod.name != '' {
+					return mod.name
+				}
+				return name
+			}
+		}
+	}
+	// Fallback: check current module scope
+	if t.cur_module != '' {
+		if mut mod_scope := t.get_module_scope(t.cur_module) {
+			if obj := mod_scope.lookup_parent(name, 0) {
+				if obj is types.Module {
+					mod := unsafe { &types.Module(&obj) }
+					if mod.name != '' {
+						return mod.name
+					}
+					return name
+				}
+			}
+		}
+	}
+	return none
+}
+
+// is_module_ident checks if an identifier refers to a module
+fn (t &Transformer) is_module_ident(name string) bool {
+	return t.resolve_module_name(name) != none
+}
+
+// type_is_string checks if a type is string, including &string (Pointer to String)
+fn (t &Transformer) type_is_string(typ types.Type) bool {
+	if typ is types.String {
+		return true
+	}
+	if typ is types.Struct && (typ as types.Struct).name == 'string' {
+		return true
+	}
+	if typ is types.Pointer {
+		return t.type_is_string(typ.base_type)
+	}
+	return false
+}
+
+// is_ptr_to_string_expr returns true if the expression has type &string (pointer to string)
+fn (t &Transformer) is_ptr_to_string_expr(expr ast.Expr) bool {
+	if expr_type := t.get_expr_type(expr) {
+		if expr_type is types.Pointer {
+			return t.type_is_string(expr_type.base_type)
+		}
+	}
+	// Also check scope for identifiers
+	if expr is ast.Ident {
+		if mut scope := t.get_current_scope() {
+			if obj := scope.lookup_parent(expr.name, 0) {
+				typ := obj.typ()
+				if typ is types.Pointer {
+					return t.type_is_string(typ.base_type)
+				}
+			}
+		}
+	}
+	return false
+}
+
+// expr_has_valid_data checks if an Expr sum type has a valid data pointer.
+// On ARM64 backend, sum types are represented as (tag: u64, data_ptr: u64).
+// Default-initialized Expr{} has data_ptr=0 (NULL), which crashes on field access.
+fn stmt_has_valid_data(stmt ast.Stmt) bool {
+	// On ARM64 backend: word1 = data pointer; NULL means corrupt/default-initialized.
+	// On C backend: word1 = first 8 bytes of inline variant data; usually non-zero for valid statements.
+	word1 := unsafe { (&u64(&stmt))[1] }
+	return word1 != 0
+}
+
+fn expr_has_valid_data(expr ast.Expr) bool {
+	// On ARM64 backend: word1 = data pointer; NULL means corrupt/default-initialized.
+	// On C backend: word1 = first 8 bytes of inline variant data; usually non-zero for valid expressions.
+	word1 := unsafe { (&u64(&expr))[1] }
+	return word1 != 0
+}
+
 // get_expr_type returns the types.Type for an expression by looking it up in the environment
 fn (t &Transformer) get_expr_type(expr ast.Expr) ?types.Type {
+	// Handle specific expression types that may not have pos info or need special handling
+	// These checks go BEFORE pos() to avoid dereferencing corrupt sum type data pointers
+	// in ARM64-compiled binaries.
+	if expr is ast.Ident {
+		// Try pos-based lookup first for Idents (faster)
+		pos := expr.pos
+		if pos.is_valid() {
+			if typ := t.env.get_expr_type(pos.id) {
+				return typ
+			}
+		}
+		return t.lookup_var_type(expr.name)
+	}
+	// For UnsafeExpr, look at the type of the inner expression
+	if expr is ast.UnsafeExpr {
+		// Try pos-based lookup first
+		if expr.pos.is_valid() {
+			if typ := t.env.get_expr_type(expr.pos.id) {
+				return typ
+			}
+		}
+		if expr.stmts.len > 0 {
+			last := expr.stmts[expr.stmts.len - 1]
+			if last is ast.ExprStmt {
+				return t.get_expr_type(last.expr)
+			}
+		}
+		return none
+	}
+	// For CallExpr/CallOrCastExpr, try pos then function return type lookup
+	if expr is ast.CallExpr {
+		pos := expr.pos
+		if pos.is_valid() {
+			if typ := t.env.get_expr_type(pos.id) {
+				return typ
+			}
+		}
+		if expr.lhs is ast.Ident {
+			return t.get_fn_return_type(expr.lhs.name)
+		}
+		return t.get_method_return_type(expr)
+	}
+	if expr is ast.CallOrCastExpr {
+		pos := expr.pos
+		if pos.is_valid() {
+			if typ := t.env.get_expr_type(pos.id) {
+				return typ
+			}
+		}
+		if expr.lhs is ast.Ident {
+			return t.get_fn_return_type(expr.lhs.name)
+		}
+		return t.get_method_return_type(expr)
+	}
+	// For other expression types, use the generic pos() dispatch
+	// Guard against corrupt sum type data in ARM64-compiled binaries
+	if !expr_has_valid_data(expr) {
+		return none
+	}
 	pos := expr.pos()
 	if pos.is_valid() {
 		if typ := t.env.get_expr_type(pos.id) {
 			return typ
 		}
-	}
-	// Fall back to scope lookup for identifiers
-	if expr is ast.Ident {
-		return t.lookup_var_type(expr.name)
 	}
 	return none
 }
@@ -1645,8 +1859,27 @@ fn (t &Transformer) array_value_elem_type(expr ast.Expr) ?string {
 	return none
 }
 
+// array_elem_needs_deep_eq returns true if the array element type is a struct or map,
+// meaning memcmp-based comparison won't work (strings, maps, nested structs need deep comparison).
+fn (t &Transformer) array_elem_needs_deep_eq(expr ast.Expr) bool {
+	recv_type := t.get_expr_type(expr) or { return false }
+	base := t.unwrap_alias_and_pointer_type(recv_type)
+	if base is types.Array {
+		elem_base := t.unwrap_alias_and_pointer_type(base.elem_type)
+		return elem_base is types.Struct || elem_base is types.Map
+	}
+	return false
+}
+
 // get_struct_field_type returns the type of a struct field from a SelectorExpr
 fn (t &Transformer) get_array_type_str(expr ast.Expr) ?string {
+	// Check for array element type overrides first (e.g. from .map(fn_name) expansion
+	// where the checker incorrectly types the result as []voidptr).
+	if expr is ast.Ident {
+		if override := t.array_elem_type_overrides[expr.name] {
+			return 'Array_${override}'
+		}
+	}
 	recv_type := t.get_expr_type(expr) or { return none }
 	base := t.unwrap_alias_and_pointer_type(recv_type)
 	if base is types.Array {
@@ -1670,6 +1903,16 @@ fn (t &Transformer) unwrap_alias_and_pointer_type(typ types.Type) types.Type {
 		cur = cur.base_type()
 	}
 	return cur
+}
+
+// get_array_nesting_depth returns the nesting depth of an array type.
+// []int → 1, [][]int → 2, [][][]int → 3, non-array → 0
+fn (t &Transformer) get_array_nesting_depth(typ types.Type) int {
+	base := t.unwrap_alias_and_pointer_type(typ)
+	if base is types.Array {
+		return 1 + t.get_array_nesting_depth(base.elem_type)
+	}
+	return 0
 }
 
 fn (t &Transformer) array_elem_type_name_for_helpers(elem_type types.Type) string {
@@ -1849,6 +2092,9 @@ fn (t &Transformer) type_to_c_name(typ types.Type) string {
 			// (This is used in map type names like Map_int_Intervalptr)
 			return '${base_name}ptr'
 		}
+		types.FnType {
+			return 'voidptr'
+		}
 		else {
 			return 'int'
 		}
@@ -1999,6 +2245,10 @@ fn (t &Transformer) get_str_fn_name_for_type(typ types.Type) ?string {
 			elem_name := t.type_to_c_name(typ.elem_type)
 			return 'Array_${elem_name}_str'
 		}
+		types.ArrayFixed {
+			elem_name := t.type_to_c_name(typ.elem_type)
+			return 'Array_fixed_${elem_name}_${typ.len}_str'
+		}
 		types.Map {
 			key_name := t.type_to_c_name(typ.key_type)
 			val_name := t.type_to_c_name(typ.value_type)
@@ -2076,4 +2326,185 @@ fn (t &Transformer) get_array_init_elem_type(expr ast.ArrayInitExpr) string {
 		}
 	}
 	return 'int' // Default
+}
+
+// resolve_typeof_expr resolves typeof(expr) to a V type name string.
+fn (t &Transformer) resolve_typeof_expr(expr ast.Expr) string {
+	if raw_type := t.get_expr_type(expr) {
+		return t.types_type_to_v(raw_type)
+	}
+	return ''
+}
+
+// c_name_to_v_name converts a C-mangled name (e.g. "os__File") to V format ("os.File").
+// Strips "builtin__" and "main__" prefixes since V doesn't show them in typeof.
+fn c_name_to_v_name(name string) string {
+	if name.starts_with('builtin__') {
+		return name['builtin__'.len..]
+	}
+	if name.starts_with('main__') {
+		return name['main__'.len..]
+	}
+	// Convert module__Name to module.Name
+	if idx := name.index('__') {
+		return name[..idx] + '.' + name[idx + 2..]
+	}
+	return name
+}
+
+// types_type_to_v converts a types.Type to a V type name string (e.g. "map[rune]int", "[]string").
+// Used for typeof(expr) which needs V syntax, not C type names.
+fn (t &Transformer) types_type_to_v(typ types.Type) string {
+	match typ {
+		types.Primitive {
+			if typ.props.has(.integer) {
+				if typ.props.has(.untyped) {
+					return 'int'
+				}
+				size := if typ.size == 0 { 32 } else { int(typ.size) }
+				is_signed := !typ.props.has(.unsigned)
+				return if is_signed {
+					match size {
+						8 { 'i8' }
+						16 { 'i16' }
+						32 { 'int' }
+						64 { 'i64' }
+						else { 'int' }
+					}
+				} else {
+					match size {
+						8 { 'u8' }
+						16 { 'u16' }
+						32 { 'u32' }
+						else { 'u64' }
+					}
+				}
+			} else if typ.props.has(.float) {
+				if typ.props.has(.untyped) {
+					return 'f64'
+				}
+				return if typ.size == 32 { 'f32' } else { 'f64' }
+			} else if typ.props.has(.boolean) {
+				return 'bool'
+			}
+			return 'int'
+		}
+		types.Pointer {
+			base := t.types_type_to_v(typ.base_type)
+			return '&' + base
+		}
+		types.Array {
+			elem := t.types_type_to_v(typ.elem_type)
+			return '[]' + elem
+		}
+		types.ArrayFixed {
+			elem := t.types_type_to_v(typ.elem_type)
+			return '[' + typ.len.str() + ']' + elem
+		}
+		types.Struct {
+			return c_name_to_v_name(typ.name)
+		}
+		types.String {
+			return 'string'
+		}
+		types.Alias {
+			return c_name_to_v_name(typ.name)
+		}
+		types.Char {
+			return 'char'
+		}
+		types.Rune {
+			return 'rune'
+		}
+		types.Void {
+			return 'void'
+		}
+		types.Enum {
+			return c_name_to_v_name(typ.name)
+		}
+		types.Interface {
+			return c_name_to_v_name(typ.name)
+		}
+		types.SumType {
+			return c_name_to_v_name(types.sum_type_name(typ))
+		}
+		types.Map {
+			key := t.types_type_to_v(typ.key_type)
+			val := t.types_type_to_v(typ.value_type)
+			return 'map[' + key + ']' + val
+		}
+		types.OptionType {
+			base := t.types_type_to_v(typ.base_type)
+			return '?' + base
+		}
+		types.ResultType {
+			base := t.types_type_to_v(typ.base_type)
+			return '!' + base
+		}
+		types.FnType {
+			return 'fn ()'
+		}
+		types.ISize {
+			return 'isize'
+		}
+		types.USize {
+			return 'usize'
+		}
+		types.Nil {
+			return 'voidptr'
+		}
+		types.None {
+			return 'void'
+		}
+		else {
+			return 'int'
+		}
+	}
+}
+
+// type_sizeof returns the byte size of a type for the native (arm64/x64) backend.
+// is_memcmp_safe_type checks if a type can be compared with memcmp.
+// Primitives and fixed arrays of primitives are safe. Types containing
+// heap pointers (dynamic arrays, strings, maps, structs) are not.
+fn (t &Transformer) is_memcmp_safe_type(typ types.Type) bool {
+	match typ {
+		types.Primitive { return true }
+		types.ArrayFixed { return t.is_memcmp_safe_type(typ.elem_type) }
+		types.Alias { return t.is_memcmp_safe_type(typ.base_type) }
+		types.Enum { return true }
+		else { return false }
+	}
+}
+
+fn (t &Transformer) type_sizeof(typ types.Type) int {
+	match typ {
+		types.Primitive {
+			if typ.size > 0 {
+				return int(typ.size) / 8
+			}
+			// bool has size 0, treat as 1 byte
+			return 1
+		}
+		types.Pointer {
+			return 8
+		}
+		types.Array {
+			return 32 // dynamic array struct: ptr(8) + 5*i32(20) padded to 32
+		}
+		types.ArrayFixed {
+			return typ.len * t.type_sizeof(typ.elem_type)
+		}
+		types.Map {
+			return 120
+		}
+		types.Alias {
+			return t.type_sizeof(typ.base_type)
+		}
+		types.Struct {
+			return 8 // fallback; structs need field-level computation
+		}
+		else {
+			return 8
+		}
+	}
 }
